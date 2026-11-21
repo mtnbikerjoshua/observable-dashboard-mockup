@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../map_dashboard_points"
+		},
+		{
+			"path": "../map_dashboard_mosaic"
+		}
+	],
+	"settings": {}
+}
