@@ -48,6 +48,39 @@ body {
   inset: 0;
 }
 
+.map-loading {
+  position: absolute;
+  z-index: 2;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: #e8eaed;
+  color: #3d4450;
+  font: 600 13px/1.2 system-ui, sans-serif;
+}
+
+.map-loading[hidden] {
+  display: none;
+}
+
+.map-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid rgba(28, 28, 28, 0.16);
+  border-top-color: #1c1c1c;
+  border-radius: 50%;
+  animation: map-spin 0.7s linear infinite;
+}
+
+@keyframes map-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .nta-tip {
   position: absolute;
   z-index: 4;
@@ -705,6 +738,10 @@ body {
 <div class="app" id="app">
   <div class="map-stage">
     <div id="map"></div>
+    <div id="map-loading" class="map-loading" role="status">
+      <div class="map-spinner" aria-hidden="true"></div>
+      Loading map
+    </div>
     <div id="nta-tip" class="nta-tip" hidden></div>
     <button type="button" id="graphs-open" class="graphs-edge" aria-label="Graphs">
       <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
@@ -763,17 +800,27 @@ body {
 </div>
 
 ```js
+// Own cell so these downloads start before maplibre and deck.gl evaluate.
+const addressBufferPromise = FileAttachment("data/addresses.bin").arrayBuffer();
+const ntaPromise = FileAttachment("data/nta-2020.geojson").json();
+```
+
+```js
 import maplibregl from "npm:maplibre-gl@5.24.1";
 import {MapboxOverlay} from "npm:@deck.gl/mapbox@9.4.1";
 import {ScatterplotLayer} from "npm:@deck.gl/layers@9.4.1";
-import * as d3 from "npm:d3@7.9.2";
+import {range} from "npm:d3-array@3.2.5";
+import {rgb} from "npm:d3-color@3.1.1";
+import {geoBounds, geoCentroid} from "npm:d3-geo@3.1.2";
+import {interpolateGreens, interpolatePurples, interpolateYlOrRd} from "npm:d3-scale-chromatic@3.1.1";
 import {ntaAreas} from "./data/nta-areas.js";
 import {assignAddressesToNtas} from "./data/assign-nta.js";
 
-const [addressBuffer, addressLineText, ntaCollection] = await Promise.all([
-  FileAttachment("data/addresses.bin").arrayBuffer(),
-  FileAttachment("data/address-lines.txt").text(),
-  FileAttachment("data/nta-2020.geojson").json()
+const d3 = {range, rgb, geoBounds, geoCentroid, interpolateGreens, interpolatePurples, interpolateYlOrRd};
+
+const [addressBuffer, ntaCollection] = await Promise.all([
+  addressBufferPromise,
+  ntaPromise
 ]);
 const view = new DataView(addressBuffer);
 if (addressBuffer.byteLength < 8) {
@@ -810,12 +857,6 @@ const lonIndex = columnIndex.get("lon");
 const latIndex = columnIndex.get("lat");
 if (lonIndex == null || latIndex == null) throw new Error("Address file is missing lon or lat");
 const metricNames = columnNames.filter((name) => name !== "lon" && name !== "lat");
-const addressLines = addressLineText.endsWith("\n")
-  ? addressLineText.slice(0, -1).split("\n")
-  : addressLineText.split("\n");
-if (addressLines.length !== pointCount) {
-  throw new Error(`Address file has ${addressLines.length} lines; expected ${pointCount} points`);
-}
 const metrics = Object.fromEntries(metricNames.map((name) => [name, new Float32Array(pointCount)]));
 const lonColumn = new Float32Array(pointCount);
 const latColumn = new Float32Array(pointCount);
@@ -901,16 +942,30 @@ function colorOf(id, value) {
   return d3.rgb(meta.interpolate(colorStop(value, meta.domain)));
 }
 
+function colorRamp(interpolate) {
+  const ramp = new Uint8Array(256 * 3);
+  for (let step = 0; step < 256; step++) {
+    const color = d3.rgb(interpolate(colorStop(step / 255)));
+    const offset = step * 3;
+    ramp[offset] = color.r;
+    ramp[offset + 1] = color.g;
+    ramp[offset + 2] = color.b;
+  }
+  return ramp;
+}
+
 const pointColors = Object.fromEntries(
   Object.keys(layerMeta).map((id) => {
+    const ramp = colorRamp(layerMeta[id].interpolate);
     const colors = new Uint8Array(pointCount * 4);
     const values = metrics[id];
     for (let i = 0; i < pointCount; i++) {
-      const color = colorOf(id, values[i]);
+      const step = Math.max(0, Math.min(255, Math.round(values[i] * 2.55)));
+      const rampOffset = step * 3;
       const offset = i * 4;
-      colors[offset] = color.r;
-      colors[offset + 1] = color.g;
-      colors[offset + 2] = color.b;
+      colors[offset] = ramp[rampOffset];
+      colors[offset + 1] = ramp[rampOffset + 1];
+      colors[offset + 2] = ramp[rampOffset + 2];
       colors[offset + 3] = 230;
     }
     return [id, colors];
@@ -931,7 +986,7 @@ const mapUi = {
   hoveredNta: null
 };
 const boundaryManual = {city: null, selected: null, select: null};
-const mapHandle = {overlay: null, pointsLayer: null, fill: null};
+const mapHandle = {overlay: null, pointsLayer: null, fill: null, deckReady: false};
 const selectedMask = new Uint8Array(neighborhoods.length + 1);
 
 function colorsForMap() {
@@ -1036,6 +1091,9 @@ paintLegend();
 ```
 
 ```js
+// Street names are for the click popup. Drawing the map does not wait on them.
+const addressLinePromise = FileAttachment("data/address-lines.txt").text();
+
 const mapContainer = document.querySelector("#map");
 const nycBounds = d3.geoBounds(ntaCollection);
 const map = new maplibregl.Map({
@@ -1063,6 +1121,7 @@ const overlay = new MapboxOverlay({
   layers: [mapHandle.pointsLayer],
   onLoad: () => {
     deckReady = true;
+    mapHandle.deckReady = true;
     // deck.gl 9.4 writes the picking layer id to blendColor. This luma build
     // only applies blendConstant, so every pick came back empty.
     const pickPass = overlay._deck.deckPicker.pickLayersPass;
@@ -1341,6 +1400,7 @@ map.on("load", () => {
   syncNeighborhoodLayers();
   renderLayers(true);
   map.resize();
+  document.querySelector("#map-loading").hidden = true;
 });
 map.on("dragstart", () => {
   dragging = true;
@@ -1385,6 +1445,36 @@ map.on("mousemove", (event) => {
   mapUi.hoveredIndex = index;
   renderLayers();
 });
+
+map.on("click", (event) => {
+  if (!mapUi.selectMode) return;
+  if (!ntaLayersReady) return;
+  const hits = map.queryRenderedFeatures(event.point, {layers: ["nta-fill"]});
+  if (!hits.length) return;
+  const id = Number(hits[0].id);
+  if (Number.isInteger(id)) toggleNeighborhood(id);
+});
+
+const resizeObserver = new ResizeObserver(() => map.resize());
+resizeObserver.observe(mapContainer);
+invalidation.then(() => {
+  resizeObserver.disconnect();
+  popup.remove();
+  map.remove();
+});
+
+const mapReady = overlay;
+```
+
+```js
+const addressLineText = await addressLinePromise;
+const addressLines = addressLineText.endsWith("\n")
+  ? addressLineText.slice(0, -1).split("\n")
+  : addressLineText.split("\n");
+if (addressLines.length !== pointCount) {
+  throw new Error(`Address file has ${addressLines.length} lines; expected ${pointCount} points`);
+}
+
 function popupHtml(index) {
   const selected = mapUi.layerId;
   const address = addressLines[index]
@@ -1413,15 +1503,7 @@ popup.on("open", () => {
 });
 
 map.on("click", (event) => {
-  if (mapUi.selectMode) {
-    if (!ntaLayersReady) return;
-    const hits = map.queryRenderedFeatures(event.point, {layers: ["nta-fill"]});
-    if (!hits.length) return;
-    const id = Number(hits[0].id);
-    if (Number.isInteger(id)) toggleNeighborhood(id);
-    return;
-  }
-  if (!deckReady) return;
+  if (mapUi.selectMode || !mapHandle.deckReady) return;
   const picked = overlay.pickObject({x: event.point.x, y: event.point.y, radius: 2});
   if (picked?.index == null || picked.index < 0) {
     popup.remove();
@@ -1434,22 +1516,15 @@ map.on("click", (event) => {
     .setHTML(popupHtml(index))
     .addTo(map);
 });
-
-const resizeObserver = new ResizeObserver(() => map.resize());
-resizeObserver.observe(mapContainer);
-invalidation.then(() => {
-  resizeObserver.disconnect();
-  popup.remove();
-  map.remove();
-});
-
-const mapReady = overlay;
 ```
 
 ```js
-import * as vg from "npm:@uwdata/vgplot@0.35.1";
-import {clauseComposite} from "npm:@uwdata/mosaic-core@0.35.1";
-import {tableFromArrays, tableToIPC} from "npm:apache-arrow@17.0.0";
+// Dynamic so DuckDB, Mosaic, and Arrow are not preloaded ahead of the map.
+const [vg, {clauseComposite}, {tableFromArrays, tableToIPC}] = await Promise.all([
+  import("npm:@uwdata/vgplot@0.35.1"),
+  import("npm:@uwdata/mosaic-core@0.35.1"),
+  import("npm:apache-arrow@17.0.0")
+]);
 
 const narrowMedia = window.matchMedia("(max-width: 999px)");
 const app = document.querySelector("#app");
