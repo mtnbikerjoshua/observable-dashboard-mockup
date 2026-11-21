@@ -1,0 +1,18 @@
+{
+  "name": "nyc-address-grid",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "observable preview",
+    "build": "observable build"
+  },
+  "dependencies": {
+    "@deck.gl/aggregation-layers": "9.4.1",
+    "@deck.gl/core": "9.4.1",
+    "@deck.gl/layers": "9.4.1",
+    "@deck.gl/mapbox": "9.4.1",
+    "@observablehq/framework": "1.13.4",
+    "d3": "7.9.2",
+    "maplibre-gl": "5.24.1"
+  }
+}
